@@ -1,0 +1,31 @@
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Validate skills
+        run: python3 tools/check_skills.py
+
+      - name: Shellcheck the installer
+        run: bash -n install.sh
+
+      - name: Install into a scratch directory
+        run: |
+          ./install.sh \
+            --opencode-dir "$RUNNER_TEMP/oc" \
+            --claude-skills-dir "$RUNNER_TEMP/cs" \
+            --claude-dir "$RUNNER_TEMP/cc"
+          test -f "$RUNNER_TEMP/cs/react/SKILL.md"
+          test -f "$RUNNER_TEMP/cs/react/references/failure-modes.md"
+          test -f "$RUNNER_TEMP/cc/react.md"

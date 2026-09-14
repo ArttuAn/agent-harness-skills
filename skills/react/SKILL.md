@@ -1,608 +1,383 @@
 ---
 name: harness-react
-description: "Build a ReAct (Reason-Act-Observe) pattern agent harness from a spec"
+description: "Build a ReAct (reason-act-observe) agent harness from a spec — a tool-calling loop with the guards that keep it terminating, testable, and recoverable"
 ---
 
 # ReAct Agent Harness
 
-## What is ReAct?
+A ReAct agent interleaves reasoning and tool use: the model thinks, calls a
+tool, reads the result, and repeats until it answers or runs out of budget.
+It is the default agent shape and the foundation the other patterns extend.
 
-ReAct (Reason + Act) is a pattern where an agent interleaves reasoning and tool use
-in a loop:
+Writing the loop is easy and a frontier model will do it unprompted. What it
+will not do unprompted is make the loop **terminate under stress, survive a
+tool that raises, stay testable without an API key, and normalize provider
+differences**. That is what this skill is for. Build the loop quickly; spend
+your effort on the guards.
 
-```
-Thought:  the LLM reasons about the current state and picks a next step
-Action:   the LLM emits a tool call to act on the world
-Observation: the tool result is fed back into the LLM prompt
-```
+## Use this when
 
-The loop repeats until the agent emits a final answer or the step budget is
-exhausted. This is the generic loop behind agents like WebGPT and many modern
-tool-using assistants.
+- The agent needs tools and the number of steps is not known in advance.
+- Each step's result should inform the next decision.
+- You want the simplest thing that can still be called an agent.
+
+**Don't use this when:**
+
+- The task has a fixed sequence of steps → write a script, not an agent.
+- A long task loses coherence halfway → `harness-plan-and-execute`.
+- The work splits into roles with unrelated context → `harness-multi-agent`.
+- Every answer must be grounded in a corpus → `harness-rag-memory` (which is
+  this loop plus retrieval).
+
+See `references/choosing-a-pattern.md` before committing.
 
 ## Workflow
 
-When the user gives you a spec (or says "build me a ReAct agent"), do the following:
+1. **Get the spec.** Domain, the 3–5 tools that matter, the endpoint (OpenAI,
+   Ollama, vLLM…), and the model. If the spec is vague, propose tools and
+   confirm before writing code.
+2. **Check the endpoint supports tool calling.** This decides the protocol
+   (below) and is the one question that changes the whole build.
+3. **Scaffold** — layout below. Standard packaging; do not overthink it.
+4. **Write the loop with every guard** in "Failure modes". Not afterwards.
+5. **Write the Tier 1 tests** from "Required tests". They run without a key.
+6. **Verify** and report honestly what ran.
 
-1. **Ask for a spec if none given.** The user should roughly describe the domain:
-   what the agent should be able to do, and what example tools make sense. If the
-   spec is vague, propose 3-5 example tools yourself and confirm.
+## The decisions that matter
 
-2. **Scaffold the project** into the directory the user specifies (default: create
-   `<folder-name>/` next to where they're working). Use a clean `src/` layout with
-   `pyproject.toml`.
+### 1. Native tool calling, or JSON in the content?
 
-3. **Write the full ReAct loop** (see the implementation below — put it in your
-   own words as needed, but it must be complete and runnable).
+The old ReAct papers predate tool-calling APIs and ask the model to emit
+`{"thought": ..., "action": ...}` as text. That is still the right choice in
+one specific case and the wrong choice otherwise.
 
-4. **Write the tool registry** with `@tool` decorator + type-hint-to-JSON-schema
-   inference.
+| | Native tool calls | JSON in content |
+| --- | --- | --- |
+| Reliability | Constrained decoding, provider-validated | Model may emit prose, fences, trailing commas |
+| Parallel calls | Supported | Awkward |
+| Works with | Most models since 2024 | Anything, including base models |
+| Code cost | Provider adapter | Fence stripping + JSON repair + retry ladder |
 
-5. **Write config handling** via env vars / `.env`, plus a **CLI entry point** and
-   **chat mode**.
+**Default to native tool calls.** Choose JSON-in-content only when the target
+model genuinely cannot do tool calls — then budget for the repair path:
 
-6. **Add a handful of example tools** relevant to the spec. Then verify the project
-   imports and the CLI `--help` runs.
+```python
+def parse_json_reply(content: str) -> dict | None:
+    """Tolerate fenced and prose-wrapped JSON. Returns None if unrecoverable."""
+    import json
 
-## Project Layout
-
-Create this structure in the target directory:
-
+    text = content.strip()
+    fence = chr(96) * 3
+    if text.startswith(fence):
+        text = text[len(fence):]
+        if text.startswith("json"):
+            text = text[4:]
+        text = text.split(fence)[0]
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start, end = text.find("{"), text.rfind("}")
+        if start != -1 and end > start:
+            try:
+                return json.loads(text[start : end + 1])
+            except json.JSONDecodeError:
+                return None
+        return None
 ```
+
+Retry at most twice with an explicit "reply with only a JSON object" message,
+then give up with a clear error. An unbounded retry loop here is its own bug.
+
+### 2. What the step budget counts
+
+Count **model calls**, not tool calls. A turn with three parallel tool calls is
+one step. This is the number that bounds cost and latency.
+
+Pick the budget from the work: 4–6 for a focused lookup agent, 8–12 for
+research. Higher is rarely better — a loop that needs 20 steps usually has a
+retrieval problem, not a budget problem.
+
+### 3. What happens when the budget runs out
+
+Do not raise. Ask once more with `tools=None` so the model has nothing to emit
+but prose (see `failure-modes.md` B2). Raise only if that is also empty.
+
+### 4. Where the reasoning goes
+
+With native tool calls, many models return **empty content plus a tool call** —
+the thought is gone. If you want a visible trace, either ask for a one-line
+rationale in the system prompt, or emit it through hooks. Do not parse it out
+of content; it is often not there.
+
+### 5. Observability is a constructor argument
+
+Add event hooks from the start — `on_llm_call`, `on_tool_call`,
+`on_tool_result`, `on_error`. A `-v` flag that prints the tool calls is the
+difference between debugging in a minute and guessing for an hour. Hooks keep
+the loop free of `print` statements and let tests observe behaviour.
+
+## Build it
+
+```text
 <project>/
-├── pyproject.toml
+├── pyproject.toml            # hatchling, src layout, one script entry point
 ├── .env.example
 ├── README.md
-└── src/<package>/
-    ├── __init__.py
-    ├── config.py        # env-based config (model, base_url, api_key, max_steps)
-    ├── loop.py          # the ReAct loop + chat loop
-    ├── tools.py         # @tool decorator, registry, schema inference
-    ├── cli.py           # entry point
-    └── tools/           # example tools
-        ├── __init__.py
-        └── examples.py
+├── src/<package>/
+│   ├── config.py             # env-driven dataclass; temperature defaults to 0
+│   ├── llm.py                # ChatClient ABC, ModelResponse, ToolCall, FakeChat, adapter
+│   ├── messages.py           # system/user/assistant/tool_result builders
+│   ├── tools.py              # @tool decorator, schema inference, coercion, executor
+│   ├── agent.py              # the loop
+│   ├── cli.py                # ask + chat, -v for hooks
+│   └── tools/examples.py     # spec-specific tools
+└── tests/                    # Tier 1, offline
 ```
 
-Use the kebab-case project name the user picked for the folder, and use the
-snake_case version as the Python package name (e.g. folder `weather-bot` →
-package `weather_bot`). The CLI command name matches the kebab-case name as is.
+Packaging, config dataclass, argparse CLI and type-hint-to-JSON-schema
+inference are standard — write them in your usual style. Two modules are not
+standard and carry the value: `llm.py` and `agent.py`.
 
-## Dependencies
+**`llm.py`** — copy the seam from `references/llm-seam.md` verbatim: the
+`ChatClient` ABC, `ToolCall`, `ModelResponse`, `FakeChat`, and the adapter for
+the target provider. `FakeChat` ships in the package, not in tests.
 
-Use only:
-
-- `openai` (for LLM calls)
-- `python-dotenv` (optional, for `.env` loading — it's tiny and standard; if the
-  user objects, read `os.getenv` only)
-- stdlib (`json`, `typing`, `inspect`, `abc`, `collections`, etc.)
-
-Do **not** pull in langchain, instructor, instructor-style validators, or any other
-heavy dependencies. Schema inference is hand-rolled in ~30 lines.
-
-## The Agent Loop (implement this in `loop.py`)
+**`agent.py`** — the loop, with the guards inline:
 
 ```python
-# src/<package>/loop.py
-"""The generic ReAct loop: Thought -> Action -> Observation -> repeat."""
-
 from __future__ import annotations
 
-import json
-from typing import Any
+from typing import Any, Callable
 
-from openai import OpenAI
+from .llm import ChatClient, ModelResponse
+from .messages import assistant, system, tool_result, user
+from .tools import Tool, ToolExecutor
 
-from .tools import ToolRegistry
+FORCE_ANSWER = (
+    "Stop calling tools and answer now, using only the results above. "
+    "If they do not answer the question, say exactly what is missing."
+)
 
-SYSTEM_PROMPT = """You are a ReAct agent. You reason and act in a loop.
-
-For each turn, respond with EXACTLY one JSON object of one of these two shapes:
-
-1. To take an action:
-{"thought": "<your reasoning>", "action": {"name": "<tool>", "args": {"<param>": <value>}}}
-
-2. To finish:
-{"thought": "<your final reasoning>", "answer": "<final answer to the user>"}
-
-Available tools:
-{tools}
-"""
+REPEAT_NUDGE = (
+    "You already ran this exact call and got the result below. Do not run it "
+    "again — either answer from what you have, or try a different approach.\n\n"
+)
 
 
-class ReActLoop:
-    def __init__(
-        self,
-        client: OpenAI,
-        registry: ToolRegistry,
-        model: str,
-        max_steps: int = 10,
-        system_prompt: str | None = None,
-    ) -> None:
+class StepBudgetExceeded(RuntimeError):
+    """The model would not stop calling tools, even when asked directly."""
+
+
+class Agent:
+    def __init__(self, client, tools=None, config=None, system_prompt=None, hooks=None):
         self.client = client
-        self.registry = registry
-        self.model = model
-        self.max_steps = max_steps
+        self.config = config
+        self.executor = ToolExecutor(tools or [])
         self.system_prompt = system_prompt
+        self.hooks: dict[str, Callable[..., Any]] = hooks or {}
+        self.messages: list[dict[str, Any]] = []
+        self._seen: dict[str, str] = {}
 
-    def _build_system_prompt(self) -> str:
-        tools = self.registry.describe()
-        return (self.system_prompt or SYSTEM_PROMPT).format(tools=tools)
+    def _emit(self, event: str, **data: Any) -> None:
+        hook = self.hooks.get(event)
+        if hook:
+            hook(**data)
 
-    def run(self, user_input: str, *, verbose: bool = True) -> str:
-        """Run the ReAct loop until an answer is produced or max_steps hits.
-
-        Returns the final answer string.
-        """
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self._build_system_prompt()},
-            {"role": "user", "content": user_input},
+    def _record(self, response: ModelResponse) -> None:
+        calls = [
+            {"id": c.id, "type": "function",
+             "function": {"name": c.name, "arguments": c.arguments}}
+            for c in response.tool_calls
         ]
+        self.messages.append(assistant(response.content, calls))
 
-        for step in range(1, self.max_steps + 1):
-            # 1) Thought + Action/Answer decision from the LLM
-            if verbose:
-                print(f"\n[step {step}/{self.max_steps}] asking model...")
-            decision = self._ask(messages)
+    def _run_tools(self, response: ModelResponse, step: int) -> None:
+        # One result message per call, always — a missing one breaks the
+        # NEXT request, not this one.
+        for call in response.tool_calls:
+            self._emit("on_tool_call", step=step, name=call.name, arguments=call.arguments)
 
-            thought = decision.get("thought", "")
-            if verbose:
-                print(f"[thought] {thought}")
-
-            if "answer" in decision:
-                answer = decision["answer"]
-                if verbose:
-                    print(f"[answer] {answer}")
-                return str(answer)
-
-            action = decision.get("action")
-            if not isinstance(action, dict) or "name" not in action:
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "Invalid response. You must output a JSON object with "
-                        "either an 'answer' field or an 'action' field."
-                    ),
-                })
-                continue
-
-            name, args = action["name"], action.get("args", {})
-            if verbose:
-                print(f"[action] {name}({args})")
-
-            # 2) Execute the tool
-            observation = self.registry.execute(name, args)
-            if verbose:
-                print(f"[observation] {observation}")
-
-            # 3) Feed the observation back and repeat
-            messages.append({
-                "role": "assistant",
-                "content": json.dumps(decision, ensure_ascii=False),
-            })
-            messages.append({
-                "role": "user",
-                "content": f"Observation from {name}: {observation}\nContinue.",
-            })
-
-        return f"Step budget ({self.max_steps}) exceeded. Last observation: {observation}"
-
-    def _ask(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        """Send the message list, get a JSON object back. Retries on bad JSON."""
-        for _ in range(3):
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,  # type: ignore[arg-type]
-                temperature=0,
-            )
-            content = response.choices[0].message.content or ""
-            content = content.strip()
-            # Tolerate fenced JSON responses (fence = 3 x chr(96))
-            fence = chr(96) * 3
-            if content.startswith(fence):
-                content = content[len(fence):]
-                if content.endswith(fence):
-                    content = content[: -len(fence)]
-                content = content.strip()
-                if content.startswith("json"):
-                    content = content[4:]
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "You did not output valid JSON. Reply with only a JSON object."
-                    ),
-                })
-        raise RuntimeError("Model repeatedly failed to produce valid JSON.")
-
-
-def chat_loop(loop: ReActLoop) -> None:
-    """Interactive REPL. The loop object's config is reused, but you may want
-    to thread `max_steps`/fresh system prompt per turn."""
-    print("ReAct agent ready. Type 'exit' or Ctrl-D to quit.")
-    while True:
-        try:
-            user_input = input("\nYou: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        if user_input in {"exit", "quit", "q"}:
-            return
-        if not user_input:
-            continue
-        answer = loop.run(user_input)
-        print(f"\nAgent: {answer}")
-```
-
-## The Tool Registry (implement this in `tools.py`)
-
-```python
-# src/<package>/tools.py
-"""Registry + @tool decorator with type-hint-to-JSON-schema inference."""
-
-from __future__ import annotations
-
-import inspect
-import types
-import typing
-
-import json
-
-def type_to_schema(t: type) -> dict:
-    """Map a Python type annotation to a JSON-schema-ish type descriptor."""
-    origin = typing.get_origin(t)
-    if origin is None:
-        if t is int:
-            return {"type": "integer"}
-        if t is float:
-            return {"type": "number"}
-        if t is bool:
-            return {"type": "boolean"}
-        if t is str:
-            return {"type": "string"}
-        if t in (list, typing.List):
-            return {"type": "array", "items": {"type": "string"}}
-        if t in (dict, typing.Dict):
-            return {"type": "object"}
-        return {"type": "string"}  # fallback: treat anything else as string
-    if origin is typing.Union:
-        # Optional[...] -> pick the first non-None branch
-        for arg in typing.get_args(t):
-            if arg is not type(None):
-                return type_to_schema(arg)
-    if origin is list or origin is typing.List:
-        (item,) = typing.get_args(t)
-        return {"type": "array", "items": type_to_schema(item)}
-    if origin is dict or origin is typing.Dict:
-        values = typing.get_args(t)
-        if values:
-            return {"type": "object", "additionalProperties": type_to_schema(values[1])}
-        return {"type": "object"}
-    if origin is typing.Literal:
-        choices = [str(a) for a in typing.get_args(t)]
-        return {"type": "string", "enum": choices}
-    # fallback
-    return {"type": "string"}
-
-
-class Tool:
-    def __init__(self, fn, name: str | None = None, description: str | None = None):
-        self.fn = fn
-        self.name = name or fn.__name__
-        sig = inspect.signature(fn)
-        self.description = (
-            description
-            if description is not None
-            else (fn.__doc__ or f"Call the {self.name} tool.").strip()
-        )
-        self.parameters = {}
-        for pname, param in sig.parameters.items():
-            if pname == "return":
-                continue
-            annotation = param.annotation if param.annotation is not inspect.Parameter.empty else str
-            pschema = type_to_schema(annotation)
-            if param.default is not inspect.Parameter.empty:
-                pschema["default"] = param.default
-                pschema["required"] = False
+            key = f"{call.name}:{sorted((call.arguments or {}).items(), key=str)}"
+            if key in self._seen:
+                result = REPEAT_NUDGE + self._seen[key]
             else:
-                pschema["required"] = True
-            self.parameters[pname] = pschema
-        self.required = [
-            p for p, ps in self.parameters.items() if ps.get("required")
-        ]
+                result = self.executor.execute(call.name, call.arguments)
+                self._seen[key] = result
 
-    def to_openai_schema(self) -> dict:
-        """Format for the tools list you pass to openai if you use native tool-calls."""
-        return {
-            "type": "function",
-            "function": {
-                "name": self.name,
-                "description": self.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        p: {k: v for k, v in s.items() if k != "required"}
-                        for p, s in self.parameters.items()
-                    },
-                    "required": self.required,
-                },
-            },
-        }
+            self._emit("on_tool_result", step=step, name=call.name, result=result)
+            self.messages.append(tool_result(call.id, call.name, result))
 
-    def __call__(self, **kwargs: typing.Any) -> typing.Any:
-        return self.fn(**kwargs)
+    def run(self, prompt: str) -> str:
+        if not self.messages and self.system_prompt:
+            self.messages.append(system(self.system_prompt))
+        self.messages.append(user(prompt))
 
+        schemas = self.executor.schemas() if self.executor else None
 
-class ToolRegistry:
-    def __init__(self) -> None:
-        self._tools: dict[str, Tool] = {}
+        for step in range(self.config.max_steps):
+            self._emit("on_llm_call", step=step)
+            try:
+                response = self.client.complete(self.messages, tools=schemas)
+            except Exception as exc:  # noqa: BLE001 - surface transport failures
+                self._emit("on_error", step=step, error=exc)
+                raise
 
-    def register(self, fn=None, *, name: str | None = None, description: str | None = None):
-        """Usage: @registry.register or @registry.register(name="x")."""
-        def wrap(f):
-            tool = Tool(f, name=name, description=description)
-            self._tools[tool.name] = tool
-            return tool
-        if fn is not None:
-            return wrap(fn)
-        return wrap
+            self._emit("on_llm_response", step=step,
+                       content=response.content, tool_calls=response.tool_calls)
+            self._record(response)
 
-    def execute(self, name: str, args: dict) -> str:
-        if name not in self._tools:
-            return f"Error: unknown tool '{name}'. Available: {', '.join(self._tools)}"
-        try:
-            result = self._tools[name](**args)
-            return json.dumps(result, ensure_ascii=False, default=str)
-        except TypeError as e:
-            return f"Error: bad arguments for {name}: {e}"
-        except Exception as e:  # tools should never crash the loop
-            return f"Error in {name}: {type(e).__name__}: {e}"
-
-    def describe(self) -> str:
-        """Human-readable tool list for the system prompt."""
-        lines = []
-        for name, tool in self._tools.items():
-            lines.append(f"- {name}: {tool.description}")
-            lines.append(f"  args: {tool.parameters}")
-        return "\n".join(lines)
-
-    @property
-    def tools(self) -> list[Tool]:
-        return list(self._tools.values())
-
-
-# Convenience decorator usable without a registry first (registers on the global one)
-_global_registry = ToolRegistry()
-
-
-def tool(fn=None, *, name=None, description=None):
-    return _global_registry.register(fn, name=name, description=description)
-```
-
-Note: `tool` registers into a module-global registry; if the user wants multiple
-registries, prefer `registry = ToolRegistry(); @registry.register`.
-
-## Config (implement this in `config.py`)
-
-```python
-# src/<package>/config.py
-"""Config from env vars / .env."""
-
-from __future__ import annotations
-
-import os
-from dataclasses import dataclass
-
-
-def load_dotenv(path: str = ".env") -> None:
-    """Minimal .env loader (no external dep)."""
-    if not os.path.exists(path):
-        return
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
+            if response.tool_calls:
+                self._run_tools(response, step)
                 continue
-            key, _, value = line.partition("=")
-            key, value = key.strip(), value.strip().strip('"').strip("'")
-            os.environ.setdefault(key, value)
 
+            if response.content and response.content.strip():
+                return response.content
 
-@dataclass
-class Config:
-    model: str = "gpt-4o-mini"
-    base_url: str = "https://api.openai.com/v1"
-    api_key: str = ""
-    max_steps: int = 10
+            # Empty content and no tool calls is a failed turn, not an answer.
+            self.messages.append(user("That reply was empty. Answer the question."))
 
-    @classmethod
-    def from_env(cls, dotenv_path: str = ".env") -> "Config":
-        load_dotenv(dotenv_path)
-        return cls(
-            model=os.getenv("AGENT_MODEL", "gpt-4o-mini"),
-            base_url=os.getenv("AGENT_BASE_URL", "https://api.openai.com/v1"),
-            api_key=os.getenv("AGENT_API_KEY", ""),
-            max_steps=int(os.getenv("AGENT_MAX_STEPS", "10")),
+        return self._force_answer()
+
+    def _force_answer(self) -> str:
+        """Last turn: no tools offered, so prose is the only thing to emit."""
+        self._emit("on_force_answer", step=self.config.max_steps)
+        self.messages.append(user(FORCE_ANSWER))
+        response = self.client.complete(self.messages, tools=None)
+        self._record(response)
+        if response.content and response.content.strip():
+            return response.content
+        raise StepBudgetExceeded(
+            f"The model called tools for {self.config.max_steps} steps and produced "
+            "no answer even when asked directly. Narrow the task or raise the budget."
         )
+
+    def reset(self) -> None:
+        self.messages = []
+        self._seen = {}
 ```
 
-## CLI (implement this in `cli.py`)
+**`tools.py`** — the executor must never raise into the loop, and must repair
+arguments before calling through. Both from `references/failure-modes.md`:
 
 ```python
-# src/<package>/cli.py
-"""Entry point: <command> "ask something" | --chat | --help"""
+class ToolExecutor:
+    def __init__(self, tools=None):
+        self._tools = {t.name: t for t in (tools or [])}
 
-import argparse
-import sys
+    def __bool__(self) -> bool:
+        return bool(self._tools)
 
-from openai import OpenAI
+    def names(self) -> list[str]:
+        return list(self._tools)
 
-from . import tools as tools_module
-from .config import Config
-from .loop import ReActLoop, chat_loop
+    def schemas(self) -> list[dict]:
+        return [t.to_schema() for t in self._tools.values()]
 
-def build_agent(cfg: Config) -> ReActLoop:
-    # Import the example tools package so @tool regustrations run.
-    from .tools import examples  # noqa: F401
-    return ReActLoop(
-        client=OpenAI(api_key=cfg.api_key, base_url=cfg.base_url),
-        registry=tools_module._global_registry,
-        model=cfg.model,
-        max_steps=cfg.max_steps,
-    )
-
-
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="<command>", description="ReAct agent harness")
-    parser.add_argument("prompt", nargs="*", help="Question to run the agent on.")
-    parser.add_argument("--chat", action="store_true", help="Interactive chat mode.")
-    parser.add_argument("--model", default=None, help="Override model.")
-    parser.add_argument("--max-steps", type=int, default=None, help="Override step budget.")
-    args = parser.parse_args(argv)
-
-    cfg = Config.from_env()
-    if args.model:
-        cfg.model = args.model
-    if args.max_steps:
-        cfg.max_steps = args.max_steps
-    if not cfg.api_key:
-        print("No AGENT_API_KEY set. Add it to .env or export it.", file=sys.stderr)
-        return 2
-
-    agent = build_agent(cfg)
-
-    if args.chat:
-        chat_loop(agent)
-        return 0
-
-    prompt = " ".join(args.prompt)
-    if not prompt:
-        parser.print_help()
-        return 1
-
-    print(agent.run(prompt))
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+    def execute(self, name: str, arguments: dict) -> str:
+        tool = self._tools.get(name)
+        if tool is None:
+            available = ", ".join(self.names()) or "none"
+            return f"Error: unknown tool '{name}'. Available tools: {available}"
+        try:
+            return tool.run(**tool.coerce(arguments))
+        except TypeError as exc:
+            return f"Error: invalid arguments for '{name}': {exc}"
+        except Exception as exc:  # noqa: BLE001 - the model reads and retries
+            return f"Error: {type(exc).__name__}: {exc}"
 ```
 
-> Fix the `from .tools import examples` line to point at wherever you put the
-> example tools (e.g. `..tools.examples`), and remember to import the tools module
-> that actually calls `@tool`.
+## Failure modes
 
-## Example Tools
+Read `references/failure-modes.md` in full — all fifteen apply to this loop,
+because every other pattern inherits it. The five that bite a ReAct agent
+first, and where each is handled above:
 
-Give the spec 3-5 small tools. Good generic defaults:
+| Failure | Guard | Where |
+| --- | --- | --- |
+| A tool raises and kills the run | Return the error as the tool result | `ToolExecutor.execute` |
+| Model repeats the same call until timeout | Cache by name+args, nudge | `_run_tools` |
+| Budget spent, user gets an exception | Toolless final turn | `_force_answer` |
+| Empty reply returned as a successful answer | Treat as a failed turn | `run` |
+| Parallel calls, one result appended | Loop over every call | `_run_tools` |
 
-- `current_time()` — returns `datetime.now().isoformat()`
-- `calculate(expression)` — safely evaluates arithmetic with `ast` or `operator`
-- `search_web(query)` — stub that returns a note it is unimplemented, or calls a free API
-- `read_file(path)` / `list_files(path)` — small filesystem helpers (be careful with
-  arbitrary paths; restrict to a whitelisted dir if the spec allows)
+Pattern-specific, beyond the shared list:
 
-Each tool is just a plain function plus `@tool`:
+- **The model answers without using tools at all.** Common on small models and
+  on questions that *sound* like general knowledge. If the agent's whole value
+  is its tools, do not leave the first call to discretion — run the obvious
+  tool yourself and put the result in the prompt.
+- **Tool descriptions are the real prompt.** Most "the agent picked the wrong
+  tool" bugs are a docstring problem, not a model problem. Say what the tool is
+  *for* and when not to use it.
+- **`max_steps=1` is a valid configuration** and a good smoke test: it proves
+  the forced-answer path works without waiting for a spiral.
+
+## Required tests
+
+All offline, using `FakeChat`. See `references/verification.md` for the full
+table; these are mandatory for this pattern:
 
 ```python
-# src/<package>/tools/examples.py
-import ast
-import operator
-from datetime import datetime
+def test_plain_answer_returns_immediately(config):
+    agent = Agent(client=FakeChat([ModelResponse(content="done")]), config=config)
+    assert agent.run("q") == "done"
+    assert agent.client.calls == 1
 
-from ..tools import tool
 
-_BIN_OPS = {
-    ast.Add: operator.add, ast.Sub: operator.sub,
-    ast.Mult: operator.mul, ast.Div: operator.truediv,
-    ast.Pow: operator.pow, ast.Mod: operator.mod,
-}
+def test_tool_error_is_reported_not_raised(config):
+    responses = [
+        ModelResponse(tool_calls=[ToolCall("c0", "boom", {})]),
+        ModelResponse(content="recovered"),
+    ]
+    agent = Agent(client=FakeChat(responses), tools=[boom], config=config)
+    assert agent.run("q") == "recovered"
+    assert "Error: ValueError" in [m for m in agent.messages if m["role"] == "tool"][0]["content"]
 
-@tool
-def current_time() -> str:
-    """Return the current date and time as an ISO-8601 string."""
-    return datetime.now().isoformat()
 
-@tool
-def calculate(expression: str) -> float:
-    """Evaluate a simple arithmetic expression (no functions, no vars)."""
-    node = ast.parse(expression, mode="eval").body
-    if not isinstance(node, ast.Expression):
-        raise ValueError("not an expression")
-    def eval_node(n):
-        if isinstance(n, ast.Constant) and isinstance(n.value, (int, float)):
-            return n.value
-        if isinstance(n, ast.BinOp):
-            op = _BIN_OPS.get(type(n.op))
-            if op is None:
-                raise ValueError(f"unsupported op: {type(n.op).__name__}")
-            return op(eval_node(n.left), eval_node(n.right))
-        if isinstance(n, ast.UnaryOp):
-            if isinstance(n.op, ast.USub):
-                return -eval_node(n.operand)
-            if isinstance(n.op, ast.UAdd):
-                return +eval_node(n.operand)
-        raise ValueError(f"unsupported node: {type(n).__name__}")
-    return eval_node(node)
+def test_budget_forces_a_toolless_answer(config):
+    looping = ModelResponse(tool_calls=[ToolCall("c0", "search", {})])
+    responses = [looping] * config.max_steps + [ModelResponse(content="forced")]
+    agent = Agent(client=FakeChat(responses), tools=[search], config=config)
+    assert agent.run("q") == "forced"
+    assert agent.client.last_tools is None
+
+
+def test_repeated_call_is_served_from_cache(config):
+    call = ToolCall("c0", "search", {"q": "x"})
+    responses = [
+        ModelResponse(tool_calls=[call]),
+        ModelResponse(tool_calls=[call]),
+        ModelResponse(content="done"),
+    ]
+    agent = Agent(client=FakeChat(responses), tools=[search], config=config)
+    agent.run("q")
+    results = [m["content"] for m in agent.messages if m["role"] == "tool"]
+    assert "You already ran this exact call" in results[1]
+
+
+def test_every_parallel_call_gets_a_result(config):
+    calls = [ToolCall("c0", "search", {"q": "a"}), ToolCall("c1", "search", {"q": "b"})]
+    responses = [ModelResponse(tool_calls=calls), ModelResponse(content="done")]
+    agent = Agent(client=FakeChat(responses), tools=[search], config=config)
+    agent.run("q")
+    assert len([m for m in agent.messages if m["role"] == "tool"]) == 2
 ```
 
-## pyproject.toml
+## Verify
 
-```toml
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+Follow `references/verification.md`. For this pattern specifically:
 
-[project]
-name = "<package-kebab>"
-version = "0.1.0"
-description = "A ReAct agent harness for <spec>"
-requires-python = ">=3.10"
-dependencies = [
-  "openai>=1.0.0",
-  "python-dotenv>=1.0.0",
-]
+1. **Tier 0** — `pip install -e ".[dev]"`, import, `--help`.
+2. **Tier 1** — `pytest -q`. All tests above pass, no network, no key.
+3. **Tier 2** — one real run with `-v`, against the endpoint from the spec:
 
-[project.scripts]
-<command> = "<package>:cli:main"
+   ```bash
+   <command> "<question needing at least one tool>" -v
+   ```
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/<package>"]
-```
+   Confirm by eye: a tool was called with sensible arguments, the result was
+   used, and the run ended on prose rather than the budget.
 
-## .env.example
-
-```
-AGENT_API_KEY=sk-...
-# AGENT_BASE_URL=https://api.openai.com/v1   # or any OpenAI-compatible endpoint
-# AGENT_MODEL=gpt-4o-mini
-# AGENT_MAX_STEPS=10
-```
-
-## Verification
-
-1. `python -m pip install -e .` in the project (or `uv sync` / `pip install -e ".[dev]"`).
-2. `python -m <package>.cli --help` — confirm help renders, no import errors.
-3. `python -m <package>.cli "today's date is when?"` against a real key, or
-   `python -m <package>.cli --chat` for the REPL.
-4. Run a 1-step smoke test (a tool with no key needed, e.g. `calculate("2+2")`) to
-   prove the loop glue works before wiring the LLM.
-
-## Conventions
-
-- Never print the raw API key; keep keys out of source and git.
-- Observation errors return as strings; the loop should never crash on a tool error.
-- Keep the loop's state in an explicit `messages` list; don't use hidden globals.
-- Prefer temp=0 so the loop is deterministic about tool calls.
-- `default=str` in `json.dumps` when serializing observations so non-serializable
-  results don't break the loop.
-
-## Example Output
-
-User: "I want an agent that answers questions about the current date, time zone, and simple arithmetic — rename the command `time-bot`."
-
-You: scaffold `~/projects/time-bot`, tools `current_time`, `time_in_zone(zone)`,
-`calculate(expr)`, a `time-bot` CLI, `.env.example`, and verify the module imports
-and prints `--help`.
+Then tell the user what actually ran. If there was no API key and Tier 2 was
+skipped, say so plainly rather than implying an end-to-end run happened.

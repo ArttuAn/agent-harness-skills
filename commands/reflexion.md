@@ -1,124 +1,59 @@
-# Build a Reflexion Agent Harness
+---
+description: Build a Reflexion agent harness from a spec (act, evaluate, reflect, retry with episodic memory)
+argument-hint: your spec — domain, tools, endpoint, constraints
+---
 
-Given the user's spec, build a complete Reflexion-pattern agent harness:
-a runnable Python project where the agent acts, gets evaluated, and on
-failure writes a self-reflection stored in episodic memory to retry smarter.
-Ask for a spec if none given (domain + how success is judged).
+Build a Reflexion agent harness for this spec:
 
-## What to build
+$ARGUMENTS
 
-Scaffold a `src/`-layout project with `pyproject.toml` into the requested
-directory (default: a folder named after the project). Use the `openai`
-library for LLM calls; no other heavy deps (dotenv is fine).
+If the spec does not say what the agent is for, which tools it needs, or which
+endpoint and model it targets, ask — briefly — then build. Do not ask for
+permission to begin.
 
-Structure:
+**Read `~/.claude/skills/reflexion/SKILL.md` first** (the `harness-reflexion` skill from
+agent-harness-skills). It carries the design decisions, the failure modes and
+the required tests. If it is not installed, the essentials are below.
 
-```
-<project>/                     # e.g. math-solver → package math_solver
-├── pyproject.toml
-├── .env.example
-├── README.md
-└── src/<package>/
-    ├── __init__.py
-    ├── config.py        # env/.env config: model, base_url, api_key, max_trials
-    ├── agent.py         # single-trial action loop (LLM → answer, ReAct-style)
-    ├── reflector.py     # transcript + failure → self-reflection note
-    ├── memory.py        # episodic memory: list of reflections, injected into prompt
-    ├── evaluator.py     # is the final answer acceptable? pass/fail + reason
-    ├── reflexion_loop.py# orchestrates trials: act → eval → reflect → retry
-    └── cli.py           # CLI with --max-trials
-```
+## Non-negotiables for this pattern
 
-## Core pieces
+- **Establish the evaluator first.** If the only judge is the same model that wrote the answer, it will approve its own work — stop and recommend plain ReAct instead. Prefer tests, ground truth, or a schema check.
+- A reflection must be a **transferable lesson** ("search_users takes an email, not an ID — look it up with find_account first"), not a retelling of what happened. Constrain to 1-3 imperative sentences.
+- Default to **episodic** memory. Persistent memory is the exciting option that fails quietly: one wrong lesson contaminates every later run.
+- `max_attempts=3`, and stop early when the score stops improving.
+- Return the **best** attempt, not the last.
+- Pass the 2-3 most recent deduplicated lessons, not every past transcript.
+- Classify transport and rate-limit errors as non-reflectable — retry with backoff, don't spend an attempt.
 
-1. **Loop** (`reflexion_loop.py`): for `trial in range(max_trials)`: inject
-   memory → run agent → evaluate answer → if pass, return; if fail, call
-   reflector, append to memory, retry. This is Shinn et al. 2023: no weight
-   updates, improvement comes from episodic memory in the prompt.
+## Non-negotiables for every pattern
 
-2. **Memory injection goes in `agent.py`** — its system prompt has a
-   `{memory_section}` slot filled from `EpisodicMemory.format_for_prompt()`,
-   which renders "Lessons from past failed attempts" with numbered reflection
-   notes. On trial 1 the slot says "(No past failures...)". This explicit
-   injection is the defining Reflexion mechanism — call it out in comments.
+Whatever the pattern, these are not optional — they are what separates this
+from a scaffold written from memory:
 
-3. **Agent** (`agent.py`): ReAct-style loop, JSON `{thought, action}` / 
-   `{thought, answer}`, returns `(final_answer, transcript)`. Tolerate fenced
-   JSON; never crash on a tool error. Tools optional — pass a
-   `tool_executor=callable(name, args) -> str`.
+- **Take the LLM client as a constructor argument.** Define your own
+  `ChatClient` ABC, `ToolCall(id, name, arguments: dict)` and `ModelResponse`,
+  and ship a `FakeChat` that replays scripted responses. The loop must never
+  construct a provider SDK. Without this seam none of the guards below can be
+  tested, which in practice means they will not be written.
+- **Normalize provider differences inside the client.** OpenAI sends tool
+  arguments as a JSON string, Ollama as a dict. OpenAI keys tool results by
+  `tool_call_id`, Ollama by `tool_name`. Ollama defaults to a 4096-token
+  context regardless of the model — set `num_ctx` explicitly.
+- **Tool errors return as text, never raise.** `f"Error: {type(exc).__name__}: {exc}"`
+  goes back to the model, which reads it and retries.
+- **One result message per tool call.** A model can emit several in one turn;
+  a missing result breaks the *next* request, not the one that caused it.
+- **Coerce arguments against the declared schema.** Models send `"5"` for an
+  integer, invent parameters, and echo the schema fragment back as the value
+  (`limit={"type": "integer"}`). Repair or drop; never let it reach the tool.
+- **On budget exhaustion, ask once more with no tools offered** so the model
+  has nothing to emit but prose. Do not raise at the user.
+- **`temperature=0`** for any turn that selects a tool.
+- **Write the offline tests before declaring done** — tool error recovery,
+  argument coercion, repeat-call handling, and the forced final answer. They
+  need no API key. Then run them.
 
-4. **Reflector** (`reflector.py`): prompt template with Task + Transcript +
-   failure reason; asks LLM for 3-6 sentence note: (1) key mistake, (2)
-   corrected strategy. temp=0.3.
-
-5. **Evaluator** (`evaluator.py`): whole-turn pass/fail (unlike plan-execute).
-   LLM judge returns `{"passed": bool, "reason": str}`; make it pluggable via
-   `eval_prompt=` (swap for a test-runner if the spec wants).
-
-6. **Config** (`config.py`): env vars `AGENT_MODEL`, `AGENT_BASE_URL`,
-   `AGENT_API_KEY`, `AGENT_MAX_TRIALS`, `AGENT_MAX_STEPS`; tiny `.env` loader.
-
-7. **Memory** (`memory.py`): just a list of reflection strings. No vector DB.
-
-## Conventions
-
-- temp=0 for agent + evaluator; reflector 0.3.
-- Each trial gets a fresh message list; only memory persists.
-- Never print or commit API keys; ship `.env.example` only.
-- Plain strings for reflections — no embeddings.
-
-## Example code (implement with your own words)
-
-```python
-# reflexion_loop.py — the heart of it
-def run(self, task: str, verbose: bool = True):
-    for trial in range(1, self.max_trials + 1):
-        memory_text = self.memory.format_for_prompt()   # ← inject memory
-        answer, transcript = self.agent.run(task, memory_text=memory_text)
-        result = self.evaluator.evaluate(task, answer)
-        if result.passed:
-            return True, answer, self.memory
-        reflection = self.reflector.reflect(task, transcript, result.reason)
-        self.memory.add(reflection)                     # ← episodic memory
-    return False, answer, self.memory
-```
-
-```python
-# memory.py — the injection format
-def format_for_prompt(self) -> str:
-    if not self.reflections:
-        return ""
-    parts = ["## Lessons from past failed attempts", "",
-             "Read these carefully — they describe mistakes you made "
-             "and strategies you should try instead:", ""]
-    for i, ref in enumerate(self.reflections, 1):
-        parts += [f"### Attempt {i} reflection", ref, ""]
-    return "\n".join(parts)
-```
-
-```python
-# agent.py — system prompt with the memory slot
-AGENT_SYSTEM_PROMPT = """You are a problem-solving agent.
-{memory_section}
-
-Respond with EXACTLY one JSON object:
-{{"thought": "...", "action": {{"name": "...", "args": {{}}}}}}
-or {{"thought": "...", "answer": "..."}}
-"""
-```
-
-## Verify before finishing
-
-1. `pip install -e .` (or `uv sync`).
-2. `python -m <package>.cli --help` — no ImportError.
-3. `python -m <package>.cli --max-trials 1 "2+2?"` smoke test; then
-   `--max-trials 3` on a real task — watch memory grow in verbose output.
-
-## Example
-
-User: "Build a math-solver agent that evaluates expressions, retrying with
-self-reflection when the answer is wrong."
-
-You: scaffold `math-solver/` with calculator tool, LLM evaluator, reflector,
-memory, `--max-trials` CLI, `.env.example`, README; verify imports + `--help`
-runs. Report structure and run instructions.
+Verify in tiers: (0) install + import + `--help`, (1) `pytest -q` offline,
+(2) one real run against the endpoint. Report exactly which tiers ran. If
+there was no API key and tier 2 was skipped, say so — do not imply an
+end-to-end run happened.

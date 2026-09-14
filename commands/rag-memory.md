@@ -1,174 +1,61 @@
-# Build a RAG / Long-term Memory Agent Harness
+---
+description: Build a RAG / memory agent harness from a spec (chunking, embeddings, hybrid retrieval and cited answers)
+argument-hint: your spec — domain, tools, endpoint, constraints
+---
 
-Given the user's spec, build a complete runnable Python project for a
-retrieval-augmented agent with persistent long-term memory. Ask for a spec if
-they didn't give one (what the agent does + what it should remember).
+Build a RAG / memory agent harness for this spec:
 
-## What to build
+$ARGUMENTS
 
-Scaffold a `src/`-layout project with `pyproject.toml` into the requested
-directory (default: a folder named after the project). **Stdlib + `openai`
-only** — no numpy, chroma, faiss, or langchain.
+If the spec does not say what the agent is for, which tools it needs, or which
+endpoint and model it targets, ask — briefly — then build. Do not ask for
+permission to begin.
 
-```
-<project>/                     # e.g. remember-bot → package remember_bot
-├── pyproject.toml
-├── .env.example
-├── README.md
-└── src/<package>/
-    ├── __init__.py
-    ├── config.py     # env/.env config: AGENT_MODEL, AGENT_BASE_URL, AGENT_API_KEY, MEMORY_TOP_K
-    ├── storage.py    # SQLite memory store (id, text, metadata, embedding BLOB)
-    ├── embeddings.py # pluggable providers: ollama (nomic-embed-text) + hash fallback
-    ├── retriever.py  # cosine top-k retrieval; injects "Relevant memories:" block
-    ├── writer.py     # LLM fact extraction + naive sentence-split fallback; upsert
-    ├── agent.py      # retrieve → complete → store → re-retrieve loop
-    └── cli.py        # <cmd> ask|chat|search, all with --memory-dir
-```
+**Read `~/.claude/skills/rag-memory/SKILL.md` first** (the `harness-rag-memory` skill from
+agent-harness-skills). It carries the design decisions, the failure modes and
+the required tests. If it is not installed, the essentials are below.
 
-## Pattern
+## Non-negotiables for this pattern
 
-Before each LLM call, embed the prompt, cosine-rank every stored memory, take
-the top-k, and prepend them as a `Relevant memories:` block in the system prompt.
-After the turn, extract facts from the user turn / tool results / answer and
-upsert them as new memories. Keep them in SQLite (float32 BLOBs via
-`array("f")`), so memory persists across sessions with no vector DB.
+- **Check the corpus size first.** Below roughly 50k tokens it fits in context and RAG makes it worse. Saying so is more valuable than building it.
+- Chunk ~1200 chars with ~200 overlap at natural boundaries, and store each chunk's **character offset** so the agent can read past the snippet.
+- `nomic-embed-text` needs `search_document: ` / `search_query: ` prefixes. Store the embedding model name with the vectors and refuse to search a store built by a different one — otherwise the change silently returns noise.
+- Semantic search alone misses exact strings (version numbers, error codes, `4271`). Add an FTS5 keyword pass. Their scores are **not comparable** — cosine is 0-1, bm25 is an unbounded rank — so keep and show which retriever found each hit. Quote FTS terms so user punctuation can't be read as syntax.
+- **Retrieve before the first model call** and put results in the prompt; do not leave grounding to the model's discretion. Put instructions above the question — a small model parrots what it read last.
+- Brute-force cosine over float32 blobs in SQLite is right at laptop scale. No vector DB until you have measured a problem.
+- Give sources stable `[S1]` ids in every snippet the model sees, and require inline citations plus a Sources list.
+- Strip `nav`/`header`/`footer`/`aside`/`script`/`style` **and `math`** when extracting HTML — MathML serializes to one character per line and poisons chunks.
+- `executemany` does not report `lastrowid`, so inserting chunks in bulk silently leaves the FTS index empty while vector-only tests still pass. Insert one at a time.
 
-## Core pieces
+## Non-negotiables for every pattern
 
-1. **Storage** (`storage.py`): `memories(id, text, metadata JSON, embedding BLOB)`.
-   `upsert(text, metadata, embedding)` inserts or updates on identical text so
-   repeated turns don't duplicate facts. Embeddings stored via
-   `array("f", vec).tobytes()` and read back with `array("f").frombytes(...)`.
+Whatever the pattern, these are not optional — they are what separates this
+from a scaffold written from memory:
 
-2. **Embeddings** (`embeddings.py`): an `EmbeddingProvider` ABC with two backends,
-   chosen by `EMBEDDING_BACKEND` (default `ollama`):
-   - `OllamaEmbeddingProvider` — POST `{model, prompt}` to
-     `http://127.0.0.1:11434/api/embeddings` with stdlib `urllib`, model
-     `nomic-embed-text`; returns `data["embedding"]`.
-   - `HashEmbeddingProvider` — deterministic feature-hash: tokenize into words +
-     char 3-grams, `blake2b` each into signed buckets of a 512-dim vector, L2
-     normalize. Offline, so tests and `search` work without a server.
-   Both must produce `list[float]`.
+- **Take the LLM client as a constructor argument.** Define your own
+  `ChatClient` ABC, `ToolCall(id, name, arguments: dict)` and `ModelResponse`,
+  and ship a `FakeChat` that replays scripted responses. The loop must never
+  construct a provider SDK. Without this seam none of the guards below can be
+  tested, which in practice means they will not be written.
+- **Normalize provider differences inside the client.** OpenAI sends tool
+  arguments as a JSON string, Ollama as a dict. OpenAI keys tool results by
+  `tool_call_id`, Ollama by `tool_name`. Ollama defaults to a 4096-token
+  context regardless of the model — set `num_ctx` explicitly.
+- **Tool errors return as text, never raise.** `f"Error: {type(exc).__name__}: {exc}"`
+  goes back to the model, which reads it and retries.
+- **One result message per tool call.** A model can emit several in one turn;
+  a missing result breaks the *next* request, not the one that caused it.
+- **Coerce arguments against the declared schema.** Models send `"5"` for an
+  integer, invent parameters, and echo the schema fragment back as the value
+  (`limit={"type": "integer"}`). Repair or drop; never let it reach the tool.
+- **On budget exhaustion, ask once more with no tools offered** so the model
+  has nothing to emit but prose. Do not raise at the user.
+- **`temperature=0`** for any turn that selects a tool.
+- **Write the offline tests before declaring done** — tool error recovery,
+  argument coercion, repeat-call handling, and the forced final answer. They
+  need no API key. Then run them.
 
-3. **Retrieval** (`retriever.py`):
-
-   ```python
-   def cosine_similarity(a, b):
-       if not a or not b or len(a) != len(b):
-           return 0.0          # mismatched dims = mixed backends
-       dot = sum(x * y for x, y in zip(a, b))
-       na = math.sqrt(sum(x*x for x in a)) or 1.0
-       nb = math.sqrt(sum(y*y for y in b)) or 1.0
-       return dot / (na * nb)
-
-   def as_context_block(self, query, top_k=None):
-       hits = self.retrieve(query, top_k=top_k)
-       if not hits:
-           return ""
-       lines = ["Relevant memories:"]
-       for score, mem in hits:
-           lines.append(f"- ({mem.metadata.get('source','memory')}, {score:.3f}) {mem.text}")
-       return "\n".join(lines)
-   ```
-
-   `MemoryAgent` builds its system prompt as `base + "\n\n" + as_context_block(...)`
-   when the block is non-empty.
-
-4. **Writer** (`writer.py`): `extract(text)` tries
-   `client.chat.completions.create(...)` asking for a JSON string array (strip
-   ``` fences), falls back to a naive sentence split (drop sentences < 12 chars /
-   < 3 words). Each fact, embedded, goes through `store.upsert(...)`;
-   `write(text, source)` returns the stored facts.
-
-5. **Agent loop** (`agent.py`):
-
-   ```python
-   def run(self, user_input, *, write_memory=True, refine=True):
-       memories = self.retriever.as_context_block(user_input, self.top_k)
-       system = build_system_prompt(self.system_prompt, memories)
-       answer = self._complete([
-           {"role": "system", "content": system},
-           {"role": "user", "content": user_input},
-       ])
-       if write_memory:
-           stored = self.writer.write(user_input, source="user")
-           stored += self.writer.write(answer, source="answer")
-           if refine and stored:                      # re-retrieve: new facts qualify
-               refreshed = self.retriever.as_context_block(user_input, self.top_k)
-               if refreshed != memories:
-                   answer = self._complete([
-                       {"role": "system", "content": build_system_prompt(self.system_prompt, refreshed)},
-                       {"role": "user", "content": "Taking the newly stored memories into account, reconsider: " + user_input},
-                   ])
-       return answer
-   ```
-
-   Also a `chat_loop(agent)` REPL — cross-turn memory is automatic since the
-   store persists.
-
-6. **CLI** (`cli.py`): subcommands `ask "<prompt>"`, `chat`, and `search "query"`
-   (query memory directly, prints `score [source] text`, **no API key needed**).
-   Add `--memory-dir` and `--top-k` to every subcommand via a small
-   `_add_common(p)` helper (flags must live on each subparser for argparse).
-   `search` returns before the API-key check.
-
-## pyproject.toml
-
-```toml
-[project]
-name = "<package-kebab>"
-version = "0.1.0"
-requires-python = ">=3.10"
-dependencies = ["openai>=1.0.0"]
-
-[project.scripts]
-<command> = "<package>:cli:main"
-
-[tool.hatch.build.targets.wheel]
-packages = ["src/<package>"]
-```
-
-.env.example:
-
-```
-AGENT_API_KEY=sk-...
-# AGENT_BASE_URL=https://api.openai.com/v1
-# AGENT_MODEL=gpt-4o-mini
-# MEMORY_TOP_K=5
-# EMBEDDING_BACKEND=ollama     # or "hash" for offline/deterministic
-# OLLAMA_EMBED_URL=http://127.0.0.1:11434/api/embeddings
-# OLLAMA_EMBED_MODEL=nomic-embed-text
-```
-
-## Conventions
-
-- Keep one embedding backend per store (hash=512 dims, nomic=768); mixing them
-  scores 0 and silences retrieval. Change backend → fresh store.
-- Write memories after completing the turn; temp=0 throughout; upsert by text to
-  dedupe. Never hardcode/print keys.
-
-## Verify before finishing
-
-1. `pip install -e .` (or `uv sync`); `python -m <package>.cli --help`.
-2. Offline smoke test (no LLM, no network):
-
-   ```bash
-   EMBEDDING_BACKEND=hash python -c "
-   from <package>.storage import MemoryStore
-   from <package>.embeddings import HashEmbeddingProvider
-   from <package>.writer import MemoryWriter
-   MemoryWriter(MemoryStore('/tmp/mem/memories.db'), HashEmbeddingProvider()).write(
-       'The user prefers short answers.', 'user')"
-   EMBEDDING_BACKEND=hash python -m <package>.cli search "how should I answer" --memory-dir /tmp/mem
-   ```
-
-3. With a key: `ask "remember my coffee is black"` → `ask "what do I drink?"`;
-   repeat in a fresh shell to show cross-session persistence.
-
-## Example
-
-User: "Build a remember-bot that remembers my preferences across sessions and
-lets me query memory from the CLI." You: scaffold `remember-bot/` with the six
-modules, wire `ask|chat|search --memory-dir`, verify the offline hash `search`
-smoke test + `--help`, report structure and run commands.
+Verify in tiers: (0) install + import + `--help`, (1) `pytest -q` offline,
+(2) one real run against the endpoint. Report exactly which tiers ran. If
+there was no API key and tier 2 was skipped, say so — do not imply an
+end-to-end run happened.

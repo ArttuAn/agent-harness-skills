@@ -1,54 +1,59 @@
-# Build a Plan-and-Execute Agent Harness
+---
+description: Build a Plan-and-execute agent harness from a spec (a planner, executor and verifier with bounded replanning)
+argument-hint: your spec — domain, tools, endpoint, constraints
+---
 
-Given the user's spec, build a complete, runnable Python project implementing
-the Plan-and-Execute pattern: plan → execute → verify → (replan) until done.
-Ask for a spec if none given (domain + example tools, target folder; propose
-3 tools if vague). Full inline reference implementations live in
-`skills/plan-and-execute/SKILL.md` — use them, adapted to the spec.
+Build a Plan-and-execute agent harness for this spec:
 
-## The pattern
+$ARGUMENTS
 
-1. **Planner** LLM turns the task into an ordered step list.
-2. **Executor** runs each step through a tool registry and captures the result.
-3. **Verifier/checkpoint** checks each step's output against its criteria.
-4. **Replan** regenerates the remaining steps if one fails or the plan goes stale.
+If the spec does not say what the agent is for, which tools it needs, or which
+endpoint and model it targets, ask — briefly — then build. Do not ask for
+permission to begin.
 
-## Layout
+**Read `~/.claude/skills/plan-and-execute/SKILL.md` first** (the `harness-plan-and-execute` skill from
+agent-harness-skills). It carries the design decisions, the failure modes and
+the required tests. If it is not installed, the essentials are below.
 
-```
-<project>/
-├── requirements.txt   # openai, python-dotenv (only)
-├── .env.example       # OPENAI_API_KEY, PLANNER_MODEL, VERIFIER_MODEL, OBJECTIVE, MAX_ATTEMPTS
-├── README.md
-├── plan.py            # Step + Plan data model (pending/running/succeeded/failed)
-├── config.py          # env/.env loading, OpenAI client, JSON extraction
-├── planner.py         # LLM → ordered steps (goal + verification criteria); local fallback
-├── executor.py        # ToolRegistry + Executor: run one step, capture result
-├── verify.py          # heuristic + LLM verifier: output vs criteria
-├── tools.py           # example domain tools + make_registry()
-├── agent.py           # Agent loop: plan → execute → verify → replan
-└── main.py            # argparse CLI entry point
-```
+## Non-negotiables for this pattern
 
-## Core points
+- The plan is **typed data**, not prose: `Step(id, description, success_check, status, result, attempts)`, persisted as JSON after every state change so a crashed run resumes.
+- **Two budgets**: steps per step, and `max_replans` (default 2-3). The second one is the one that runs away.
+- Replan only on *permanent* failure; retry the step on a transient one.
+- Every step needs an observable `success_check`. Reject steps like "analyze the data" — the verifier can only rubber-stamp them.
+- Prefer a mechanical check (exit code, file exists, tests pass) over an LLM verdict. Give an LLM verifier the result and criteria only, never the executor's reasoning.
+- When a step fails permanently, mark dependent steps SKIPPED rather than running them on bad state.
+- Out of replans: return the partial plan with the blocking step. Never raise at the user.
 
-- Steps carry `goal`, `verification_criteria`, optional `tool`; status is a
-  pending → running → succeeded | failed state machine.
-- Tools are plain `(objective, goal) -> str` callables; executors catch tool
-  errors so a crash becomes a failed step, never a dead loop.
-- The verifier gates progress: output that fails the criteria = failed step.
-- `replan` keeps succeeded steps and regenerates the rest; `--max-attempts`
-  bounds retries (default 3).
-- No `OPENAI_API_KEY` → deterministic local planner + heuristic verifier so the
-  demo runs entirely offline.
+## Non-negotiables for every pattern
 
-## Verify before finishing
+Whatever the pattern, these are not optional — they are what separates this
+from a scaffold written from memory:
 
-1. `python -m py_compile plan.py config.py planner.py executor.py verify.py tools.py agent.py main.py`.
-2. `python main.py "prepare a weekly status summary"` — runs offline (local
-   fallback), final plan JSON prints with all steps `succeeded`.
-3. With a key set, `PLANNER_MODEL`/`VERIFIER_MODEL` drive LLM planning + judging.
-4. Fail path: a broken tool → step `failed` → replan → stop cleanly at
-   `--max-attempts` (remaining steps marked `failed`).
+- **Take the LLM client as a constructor argument.** Define your own
+  `ChatClient` ABC, `ToolCall(id, name, arguments: dict)` and `ModelResponse`,
+  and ship a `FakeChat` that replays scripted responses. The loop must never
+  construct a provider SDK. Without this seam none of the guards below can be
+  tested, which in practice means they will not be written.
+- **Normalize provider differences inside the client.** OpenAI sends tool
+  arguments as a JSON string, Ollama as a dict. OpenAI keys tool results by
+  `tool_call_id`, Ollama by `tool_name`. Ollama defaults to a 4096-token
+  context regardless of the model — set `num_ctx` explicitly.
+- **Tool errors return as text, never raise.** `f"Error: {type(exc).__name__}: {exc}"`
+  goes back to the model, which reads it and retries.
+- **One result message per tool call.** A model can emit several in one turn;
+  a missing result breaks the *next* request, not the one that caused it.
+- **Coerce arguments against the declared schema.** Models send `"5"` for an
+  integer, invent parameters, and echo the schema fragment back as the value
+  (`limit={"type": "integer"}`). Repair or drop; never let it reach the tool.
+- **On budget exhaustion, ask once more with no tools offered** so the model
+  has nothing to emit but prose. Do not raise at the user.
+- **`temperature=0`** for any turn that selects a tool.
+- **Write the offline tests before declaring done** — tool error recovery,
+  argument coercion, repeat-call handling, and the forced final answer. They
+  need no API key. Then run them.
 
-Report the output tree and the exact run command.
+Verify in tiers: (0) install + import + `--help`, (1) `pytest -q` offline,
+(2) one real run against the endpoint. Report exactly which tiers ran. If
+there was no API key and tier 2 was skipped, say so — do not imply an
+end-to-end run happened.

@@ -1,127 +1,61 @@
-# Build a Self-Evolving Agent Harness
+---
+description: Build a Self-evolving agent harness from a spec (run, evaluate, reflect, apply — gated by tests it cannot edit)
+argument-hint: your spec — domain, tools, endpoint, constraints
+---
 
-Given the user's spec, build a self-evolving agent harness: a Python project that
-runs an LLM agent, evaluates its performance, reflects on failures, and applies
-improvements to its own prompt/tools/config between generations. Ask for a spec
-if missing (domain, task type, evaluation criteria).
+Build a Self-evolving agent harness for this spec:
 
-## What to build
+$ARGUMENTS
 
-Scaffold a `src/`-layout project into the requested directory. Use the `openai`
-library; minimal deps (dotenv is fine). The core loop is:
+If the spec does not say what the agent is for, which tools it needs, or which
+endpoint and model it targets, ask — briefly — then build. Do not ask for
+permission to begin.
 
-```
-Run → Evaluate → Reflect → Apply → Repeat × N generations
-```
+**Read `~/.claude/skills/self-evolving/SKILL.md` first** (the `harness-self-evolving` skill from
+agent-harness-skills). It carries the design decisions, the failure modes and
+the required tests. If it is not installed, the essentials are below.
 
-Structure:
+## Non-negotiables for this pattern
 
-```
-<project>/
-├── pyproject.toml
-├── .env.example
-├── README.md
-└── src/<package>/
-    ├── __init__.py
-    ├── config.py        # env config: model, base_url, api_key, max_steps
-    ├── prompt.py        # SYSTEM_PROMPT constant (edited by applier)
-    ├── evaluator.py     # scores transcript: completeness, correctness, efficiency
-    ├── reflector.py     # LLM reflection → improvement proposals (JSON)
-    ├── applier.py       # writes prompt edits, new tools, config changes
-    ├── evolve.py        # main loop: run → eval → reflect → apply × N
-    ├── tools/
-    │   ├── __init__.py  # @tool registry, list_tools(), execute()
-    │   └── examples.py  # 3-5 domain-relevant starter tools
-    └── cli.py           # argparse: task arg, --generations, --model
-```
+- **Containment before the loop.** An optimizer with write access to its own scoring function optimizes the scoring function. Enforce protected paths (tests, scorer, gate, applier, eval set) with a path check in code — not an instruction in a prompt.
+- If you cannot write a fixed evaluation set first, stop and recommend `harness-reflexion`. No fixed metric means no gradient.
+- Evolve prompts, tool descriptions and few-shot examples. Not the loop, never the gate.
+- The gate requires tests green **and** score improved. Either alone lets quality slide.
+- Every generation is a git commit; a rejected generation is `reset --hard`. Refuse to start on a dirty tree or outside a repo.
+- Hold out an eval set the loop never optimizes against, and report dev and holdout side by side. Diverging lines are the finding.
+- `temperature=0` when scoring — otherwise the gate accepts noise.
+- Bound generations (default 5) and cap evolved prompt length; steady growth with a flat score is padding.
+- Assume the metric will be gamed. Score more than one dimension and read the diffs.
 
-## Core modules
+## Non-negotiables for every pattern
 
-### evaluator.py
+Whatever the pattern, these are not optional — they are what separates this
+from a scaffold written from memory:
 
-Score a run transcript against weighted criteria. Return `{score, breakdown, issues}`:
+- **Take the LLM client as a constructor argument.** Define your own
+  `ChatClient` ABC, `ToolCall(id, name, arguments: dict)` and `ModelResponse`,
+  and ship a `FakeChat` that replays scripted responses. The loop must never
+  construct a provider SDK. Without this seam none of the guards below can be
+  tested, which in practice means they will not be written.
+- **Normalize provider differences inside the client.** OpenAI sends tool
+  arguments as a JSON string, Ollama as a dict. OpenAI keys tool results by
+  `tool_call_id`, Ollama by `tool_name`. Ollama defaults to a 4096-token
+  context regardless of the model — set `num_ctx` explicitly.
+- **Tool errors return as text, never raise.** `f"Error: {type(exc).__name__}: {exc}"`
+  goes back to the model, which reads it and retries.
+- **One result message per tool call.** A model can emit several in one turn;
+  a missing result breaks the *next* request, not the one that caused it.
+- **Coerce arguments against the declared schema.** Models send `"5"` for an
+  integer, invent parameters, and echo the schema fragment back as the value
+  (`limit={"type": "integer"}`). Repair or drop; never let it reach the tool.
+- **On budget exhaustion, ask once more with no tools offered** so the model
+  has nothing to emit but prose. Do not raise at the user.
+- **`temperature=0`** for any turn that selects a tool.
+- **Write the offline tests before declaring done** — tool error recovery,
+  argument coercion, repeat-call handling, and the forced final answer. They
+  need no API key. Then run them.
 
-```python
-def evaluate(transcript: list[dict], criteria: dict | None = None) -> dict:
-    criteria = criteria or {"completeness": 4, "correctness": 4, "efficiency": 2}
-    max_weight = sum(criteria.values())
-    has_answer = any(
-        "answer" in (json.loads(m["content"]) if isinstance(m["content"], str) else {})
-        for m in transcript if m["role"] == "assistant"
-    )
-    tool_calls = sum(
-        1 for m in transcript
-        if m["role"] == "assistant" and isinstance(m.get("content"), str) and '"action"' in m["content"]
-    )
-    errors = sum(
-        1 for m in transcript
-        if m["role"] == "tool" and "error" in (m.get("content") or "").lower()
-    )
-    breakdown = {
-        "completeness": 10 if has_answer else 3,
-        "correctness": max(0, 10 - errors * 3),
-        "efficiency": max(0, 10 - max(0, tool_calls - 3)),
-    }
-    weighted = sum(breakdown[k] * criteria.get(k, 1) for k in criteria)
-    issues = []
-    if not has_answer:
-        issues.append("No final answer produced.")
-    if errors:
-        issues.append(f"{errors} tool error(s).")
-    return {"score": int(weighted / max_weight * 10), "breakdown": breakdown, "issues": issues}
-```
-
-### reflector.py
-
-Send the transcript + score to the LLM; get back structured improvement proposals:
-
-```python
-def reflect(transcript: list[dict], evaluation: dict) -> dict:
-    client = OpenAI(api_key=API_KEY, base_url=BASE_URL) if BASE_URL else OpenAI(api_key=API_KEY)
-    resp = client.chat.completions.create(
-        model=MODEL, temperature=0.3,
-        messages=[
-            {"role": "system", "content": REFLECT_SYSTEM},
-            {"role": "user", "content": f"Transcript:\n{json.dumps(transcript[-10:], default=str)}\nEval:\n{json.dumps(evaluation)}"},
-        ],
-        response_format={"type": "json_object"},
-    )
-    return json.loads(resp.choices[0].message.content or "{}")
-```
-
-The reflector returns: `{prompt_edits: [...], new_tools: [...], tool_fixes: [...], config_tuning: {...}, reasoning: "..."}`.
-
-### applier.py
-
-Apply approved changes — append prompt edits, insert new tool functions, replace broken tools, update `.env` config. Keep changes append-only.
-
-### evolve.py
-
-The main loop:
-1. `run_agent(task)` — ReAct-style loop using `SYSTEM_PROMPT` + tool registry
-2. `evaluate(transcript)` — score it
-3. `reflect(transcript, eval)` — get proposals
-4. `apply_improvements(proposals)` — write changes
-5. `run_tests()` — execute `pytest` if present; halt on failure
-6. Log everything to `generations/` directory
-7. Repeat for N generations
-
-## Safety rules
-
-- **Append-only**: applier never deletes existing code, only appends/replaces.
-- **Test gate**: run `pytest` after every apply. If tests fail, halt and print revert instructions.
-- **Git-friendly**: each generation should be its own git commit so changes are reversible.
-- **No secrets**: load API keys from `.env`; ship `.env.example` with dummies.
-- **Transcript truncation**: reflector only sees last 10 messages to control token cost.
-
-## Conventions
-
-- temp=0 for agent runs; 0.3 for reflection.
-- `json.dumps(..., default=str)` for serializing observations.
-- Register tools by importing examples module in the package `__init__.py`.
-
-## Verify
-
-1. `pip install -e .` — clean imports.
-2. `python -m <package>.cli "What is 2+2?" -g 2` — loop runs, `generations/` has log files.
-3. Inspect `generations/gen_001_proposals.json` — structured proposals present.
+Verify in tiers: (0) install + import + `--help`, (1) `pytest -q` offline,
+(2) one real run against the endpoint. Report exactly which tiers ran. If
+there was no API key and tier 2 was skipped, say so — do not imply an
+end-to-end run happened.
