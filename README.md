@@ -147,6 +147,13 @@ The most valuable contribution is a failure mode with a reproduction: what you
 saw, which endpoint, and the guard that fixed it. Those go in
 `references/failure-modes.md` and improve all seven skills at once.
 
+## Related
+
+Three repositories, one scaffold: same skill format, same `install.sh`, same `tools/check_skills.py`.
+
+- [**agent-memory-skills**](https://github.com/ArttuAn/agent-memory-skills) — Skills for what the agent remembers — working, episodic, semantic, procedural, graph and temporal memory, with an eval harness.
+- [**eu-compliance-skills**](https://github.com/ArttuAn/eu-compliance-skills) — Skills that interrogate you before the code exists — GDPR, AI Act, CRA, NIS2, DSA, EAA, ePrivacy, with a gate that refuses on a blocker.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
