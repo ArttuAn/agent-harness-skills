@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: How to contribute (agents included)
+    url: https://github.com/ArttuAn/agent-harness-skills/blob/main/AGENTS.md
+    about: The full contract in one page — the bar, the validator, the templates.

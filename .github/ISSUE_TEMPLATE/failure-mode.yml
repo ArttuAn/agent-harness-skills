@@ -1,0 +1,32 @@
+name: Failure mode
+description: Something an agent harness got wrong in production, and the guard that fixed it
+title: "failure mode: "
+labels: ["failure-mode", "good first issue"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        The most valuable contribution here, and the smallest. It lands in
+        `references/failure-modes.md` and improves all seven skills at once.
+  - type: textarea
+    id: symptom
+    attributes:
+      label: What did you see?
+      description: The symptom, with the real error string if there was one.
+      placeholder: "The next request failed with 400 invalid_request_error, not the one that caused it."
+    validations:
+      required: true
+  - type: input
+    id: where
+    attributes:
+      label: Endpoint / model
+      placeholder: "Ollama 0.5, llama3.1:8b — or: OpenAI, gpt-4o-mini"
+    validations:
+      required: true
+  - type: textarea
+    id: guard
+    attributes:
+      label: What fixed it?
+      description: The guard, stated so someone can implement it without guessing.
+    validations:
+      required: true

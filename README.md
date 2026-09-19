@@ -132,20 +132,32 @@ slash command. Runs in CI on every push.
 
 ## Adding a pattern
 
-1. `skills/<name>/SKILL.md` with `name: harness-<name>` and a one-line
-   `description`.
-2. All five required sections. If you cannot fill **"The decisions that
-   matter"** and **"Failure modes"** with things you have actually seen go
-   wrong, the pattern does not need a skill — the model already handles it.
+1. Copy `docs/TEMPLATE-SKILL.md` to `skills/<name>/SKILL.md` and
+   `docs/TEMPLATE-COMMAND.md` to `commands/<name>.md`.
+2. Fill in all five required sections. If you cannot fill **"The decisions
+   that matter"** and **"Failure modes"** with things you have actually seen
+   go wrong, the pattern does not need a skill — the model already handles it.
 3. Cite `references/` instead of restating it.
-4. `commands/<name>.md` — a thin wrapper with the pattern's non-negotiables.
-5. `python3 tools/check_skills.py` must pass.
+4. `python3 tools/check_skills.py` must pass.
 
-## Contributing
+## Contributing — people and agents
 
 The most valuable contribution is a failure mode with a reproduction: what you
 saw, which endpoint, and the guard that fixed it. Those go in
 `references/failure-modes.md` and improve all seven skills at once.
+
+The whole contract is one page: **[AGENTS.md](AGENTS.md)**. It states the bar,
+the validator, the file layout and what gets rejected, with no conventions left
+implicit — so an agent can contribute correctly without reading the repository
+first. If you are pointing a coding agent here, point it there.
+
+```sh
+python3 tools/check_skills.py    # the judge: no network, no API key, under a second
+```
+
+Issues labelled [`good first issue`](../../issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22)
+are deliberately self-contained — one file, a stated bar, the validator as the
+oracle. [CONTRIBUTING.md](CONTRIBUTING.md) has the longer version.
 
 ## Related
 

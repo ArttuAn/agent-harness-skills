@@ -5,6 +5,11 @@ on:
     branches: [main]
   pull_request:
 
+# Contributions arrive from forks. This workflow holds no secrets and needs
+# no write access, so an untrusted PR can run the validator and nothing else.
+permissions:
+  contents: read
+
 jobs:
   validate:
     runs-on: ubuntu-latest

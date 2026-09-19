@@ -1,0 +1,18 @@
+name: Fix an existing skill
+description: A decision that is wrong, a default that has aged, a test that misses its case
+title: "fix: "
+labels: ["fix"]
+body:
+  - type: dropdown
+    id: skill
+    attributes:
+      label: Which skill?
+      options: [react, plan-and-execute, reflexion, multi-agent, code-agent, rag-memory, self-evolving, references]
+    validations:
+      required: true
+  - type: textarea
+    id: wrong
+    attributes:
+      label: What is wrong, and what broke because of it?
+    validations:
+      required: true

@@ -1,0 +1,32 @@
+name: New pattern
+description: Propose a harness pattern that is not one of the seven
+title: "pattern: "
+labels: ["new-pattern"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check `references/choosing-a-pattern.md` first — most proposals are an
+        existing pattern under a new name, and those are better as an extension.
+  - type: input
+    id: name
+    attributes:
+      label: Pattern name
+    validations:
+      required: true
+  - type: textarea
+    id: gets-wrong
+    attributes:
+      label: What does a frontier model get wrong here?
+      description: >
+        The bar for this repo. If a good model builds this correctly from a
+        bare spec, it does not need a skill. Name the specific thing it botches.
+    validations:
+      required: true
+  - type: textarea
+    id: distinct
+    attributes:
+      label: Why is this not one of the seven?
+      description: Say which existing pattern it is closest to, and what differs.
+    validations:
+      required: true
