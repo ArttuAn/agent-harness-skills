@@ -4,7 +4,9 @@ const path = require('node:path');
 const { test } = require('node:test');
 const vm = require('node:vm');
 
-const workflow = fs.readFileSync(process.env.CLAUDE_WORKFLOW || path.join(__dirname, '../.github/workflows/claude.yml'), 'utf8').replace(/\r\n/g, '\n');
+// Test repository-owned code only; an environment-selected file must not
+// become executable JavaScript inside the expression evaluator.
+const workflow = fs.readFileSync(path.join(__dirname, '../.github/workflows/claude.yml'), 'utf8').replace(/\r\n/g, '\n');
 const expression = workflow.match(/    if: \|\n([\s\S]*?)(?=    runs-on:)/)[1];
 const gate = new vm.Script(`(${expression})`);
 function permitted(event_name, commentAuthor, issueAuthor, mention = '@claude') {
