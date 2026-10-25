@@ -22,6 +22,9 @@ jobs:
       - name: Validate skills
         run: python3 tools/check_skills.py
 
+      - name: Installer security regressions
+        run: python3 -m unittest discover -s tests -v
+
       - name: Verify Claude trigger authorization
         run: node --test tests/claude-trigger.test.cjs
 

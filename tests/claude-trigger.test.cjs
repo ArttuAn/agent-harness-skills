@@ -2,19 +2,19 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { test } = require('node:test');
-const vm = require('node:vm');
+const { evaluateExpression } = require('./github-expression.cjs');
 
-const workflow = fs.readFileSync(process.env.CLAUDE_WORKFLOW || path.join(__dirname, '../.github/workflows/claude.yml'), 'utf8');
+// Test repository-owned code only; an environment-selected file must not
+// become input to the workflow condition parser.
+const workflow = fs.readFileSync(path.join(__dirname, '../.github/workflows/claude.yml'), 'utf8').replace(/\r\n/g, '\n');
 const expression = workflow.match(/    if: \|\n([\s\S]*?)(?=    runs-on:)/)[1];
-const gate = new vm.Script(`(${expression})`);
 function permitted(event_name, commentAuthor, issueAuthor, mention = '@claude') {
-  return gate.runInNewContext({
-    github: { event_name, event: {
-      comment: { body: mention, author_association: commentAuthor },
-      issue: { body: mention, author_association: issueAuthor },
-    } },
-    contains: (value, needle) => value?.includes(needle) || false,
-    fromJSON: JSON.parse,
+  return evaluateExpression(expression, {
+    'github.event_name': event_name,
+    'github.event.comment.body': mention,
+    'github.event.comment.author_association': commentAuthor,
+    'github.event.issue.body': mention,
+    'github.event.issue.author_association': issueAuthor,
   });
 }
 
@@ -41,4 +41,15 @@ test('issue events authorize the issue author and require an explicit mention', 
 });
 test('unrelated events never invoke Claude', () => {
   assert.equal(permitted('push', 'OWNER', 'OWNER'), false);
+});
+
+test('unsupported functions and executable syntax are rejected', () => {
+  for (const source of ['process.exit()', 'require("fs")', 'contains.constructor("return 1")()', 'x; y']) {
+    assert.throws(() => evaluateExpression(source, {}), /Unsupported/);
+  }
+});
+
+test('event bodies are data and cannot introduce expression syntax', () => {
+  assert.equal(permitted('issue_comment', 'NONE', 'OWNER', "@claude'); process.exit()"), false);
+  assert.equal(permitted('issue_comment', 'OWNER', 'NONE', "@claude'); process.exit()"), true);
 });
