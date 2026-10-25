@@ -23,9 +23,9 @@ MODE="global"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --project) MODE="project"; shift ;;
-    --opencode-dir) OPENCODE_DEST="$2"; shift 2 ;;
-    --claude-skills-dir) CLAUDE_SKILLS_DEST="$2"; shift 2 ;;
-    --claude-dir) CLAUDE_DEST="$2"; shift 2 ;;
+    --opencode-dir) [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--opencode-dir requires a directory" >&2; exit 2; }; OPENCODE_DEST="$2"; shift 2 ;;
+    --claude-skills-dir) [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--claude-skills-dir requires a directory" >&2; exit 2; }; CLAUDE_SKILLS_DEST="$2"; shift 2 ;;
+    --claude-dir) [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || { echo "--claude-dir requires a directory" >&2; exit 2; }; CLAUDE_DEST="$2"; shift 2 ;;
     --check) python3 "$HERE/tools/check_skills.py"; exit $? ;;
     --help|-h) sed -n '2,10p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
@@ -47,30 +47,8 @@ fi
 echo "validating..."
 python3 "$HERE/tools/check_skills.py" --quiet
 
-install_skills_into() {
-  local dest="$1" label="$2"
-  echo "$label -> $dest"
-  mkdir -p "$dest"
-  for skill_dir in "$SKILLS_SRC"/*; do
-    name="$(basename "$skill_dir")"
-    rm -rf "${dest:?}/$name"
-    cp -R "$skill_dir" "$dest/$name"
-    # The shared references travel with every skill so a SKILL.md can cite
-    # them wherever it was installed.
-    cp -R "$REFERENCES_SRC" "$dest/$name/references"
-    echo "  installed skill: $name"
-  done
-}
-
-install_skills_into "$OPENCODE_DEST" "opencode skills"
-install_skills_into "$CLAUDE_SKILLS_DEST" "claude skills "
-
-echo "claude commands  -> $CLAUDE_DEST"
-mkdir -p "$CLAUDE_DEST"
-for command in "$COMMANDS_SRC"/*.md; do
-  cp "$command" "$CLAUDE_DEST/$(basename "$command")"
-  echo "  installed command: $(basename "$command")"
-done
-
-echo
-echo "done — 7 skills, 7 slash commands, references bundled with each skill."
+exec python3 "$HERE/tools/install_safe.py" \
+  --root "$HERE" \
+  --opencode-dir "$OPENCODE_DEST" \
+  --claude-dir "$CLAUDE_DEST" \
+  --claude-skills-dir "$CLAUDE_SKILLS_DEST"
