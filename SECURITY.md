@@ -18,6 +18,7 @@ represent the intended local file-copy capability. Review that trust boundary
 when changing callers. This rationale does not apply to paths from a network
 request, an untrusted archive or a model response.
 
-The Claude authorization test evaluates the checked-in workflow condition as
-repository-owned test code. It no longer accepts an environment-selected source
-file. CI executes repository tests without repository secrets or write access.
+The Claude authorization test reads only the checked-in workflow condition and
+uses a limited expression parser that cannot execute JavaScript. Unsupported
+syntax fails the test. It does not accept an environment-selected source file.
+CI executes repository tests without repository secrets or write access.
