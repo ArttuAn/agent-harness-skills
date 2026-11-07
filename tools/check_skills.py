@@ -32,6 +32,7 @@ REQUIRED_SECTIONS = [
 ]
 
 FENCE = re.compile(r"^```(\w+)?[ \t]*$")
+REFERENCE = re.compile(r"`(references/[^`/\\\r\n]+\.md)`")
 # Placeholders are intentional in template code; blank them before compiling.
 PLACEHOLDER = re.compile(r"<[a-z][a-z0-9_.\- ]*>")
 
@@ -104,6 +105,12 @@ def check_sections(path: Path, text: str, errors: list[str]) -> None:
             errors.append(f"{path.relative_to(ROOT)}: missing required section '{section}'")
 
 
+def check_references(path: Path, text: str, errors: list[str]) -> None:
+    for target in sorted(set(REFERENCE.findall(text))):
+        if not (ROOT / target).is_file():
+            errors.append(f"{path.relative_to(ROOT)}: cites missing {target}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--quiet", action="store_true")
@@ -121,16 +128,21 @@ def main() -> int:
         check_frontmatter(path, text, errors)
         check_sections(path, text, errors)
         total_blocks += check_python(path, text, errors)
+        check_references(path, text, errors)
 
         command = COMMANDS / f"{path.parent.name}.md"
         if not command.exists():
             errors.append(f"skills/{path.parent.name}: no matching commands/{path.parent.name}.md")
 
     for path in sorted(COMMANDS.glob("*.md")):
-        total_blocks += check_python(path, path.read_text(encoding="utf-8"), errors)
+        text = path.read_text(encoding="utf-8")
+        total_blocks += check_python(path, text, errors)
+        check_references(path, text, errors)
 
     for path in sorted((ROOT / "references").glob("*.md")):
-        total_blocks += check_python(path, path.read_text(encoding="utf-8"), errors)
+        text = path.read_text(encoding="utf-8")
+        total_blocks += check_python(path, text, errors)
+        check_references(path, text, errors)
 
     if errors:
         print(f"FAIL — {len(errors)} problem(s):\n")
